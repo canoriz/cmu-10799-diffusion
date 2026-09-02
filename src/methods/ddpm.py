@@ -254,6 +254,66 @@ class DDPM(BaseMethod):
 
         Generate samples from Gaussian noise using full or respaced DDPM.
         """
+        samples, _, _ = self._sample_loop(
+            batch_size=batch_size,
+            image_shape=image_shape,
+            collect_trajectory=False,
+            **kwargs,
+        )
+        return samples
+
+    @torch.no_grad()
+    def sample_trajectory(
+        self,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        trajectory_interval: int = 100,
+        trajectory_samples: Optional[int] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate samples and snapshots from the reverse diffusion chain.
+
+        Returns ``(samples, trajectory, timesteps)``. ``trajectory`` has shape
+        ``(frames, trajectory_samples, channels, height, width)`` and contains
+        the initial Gaussian noise followed by states saved every
+        ``trajectory_interval`` reverse transitions. The final x_0 state is
+        always included. Snapshots are moved to CPU so recording a trajectory
+        does not retain GPU memory.
+        """
+        try:
+            trajectory_interval = int(trajectory_interval)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trajectory_interval must be a positive integer") from exc
+        if trajectory_interval < 1:
+            raise ValueError("trajectory_interval must be a positive integer")
+        if trajectory_samples is None:
+            trajectory_samples = batch_size
+        try:
+            trajectory_samples = int(trajectory_samples)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trajectory_samples must be a positive integer") from exc
+        if not 1 <= trajectory_samples <= batch_size:
+            raise ValueError("trajectory_samples must be between 1 and batch_size")
+        return self._sample_loop(
+            batch_size=batch_size,
+            image_shape=image_shape,
+            trajectory_interval=trajectory_interval,
+            trajectory_samples=trajectory_samples,
+            collect_trajectory=True,
+            **kwargs,
+        )
+
+    @torch.no_grad()
+    def _sample_loop(
+        self,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        collect_trajectory: bool,
+        trajectory_interval: Optional[int] = None,
+        trajectory_samples: Optional[int] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Shared implementation for final-only and trajectory sampling."""
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         if len(image_shape) != 3 or any(int(dim) < 1 for dim in image_shape):
@@ -273,13 +333,35 @@ class DDPM(BaseMethod):
         timesteps = torch.linspace(self.num_timesteps - 1, 0, num_steps, device=device).round().long()
         timesteps = torch.unique_consecutive(timesteps)
         self.eval_mode()
+        trajectory = None
+        trajectory_timesteps = None
+        if collect_trajectory:
+            if trajectory_interval is None:
+                raise ValueError("trajectory_interval is required when collecting a trajectory")
+            trajectory = [x[:trajectory_samples].detach().float().cpu()]
+            trajectory_timesteps = [int(timesteps[0].item())]
         for index, current in enumerate(timesteps):
             previous = timesteps[index + 1] if index + 1 < timesteps.numel() else -1
             t = torch.full((batch_size,), int(current.item()), device=device, dtype=torch.long)
             x = self.reverse_process(x, t, t_prev=previous, clip_denoised=clip_denoised)
+            transition = index + 1
+            if collect_trajectory and (
+                transition % trajectory_interval == 0 or transition == timesteps.numel()
+            ):
+                trajectory.append(x[:trajectory_samples].detach().float().cpu())
+                trajectory_timesteps.append(
+                    int(previous.item()) if torch.is_tensor(previous) else int(previous)
+                )
         # Added implementation: start from Gaussian noise and run the configured
         # full or respaced reverse-time schedule.
-        return x.clamp(-1.0, 1.0)
+        samples = x.clamp(-1.0, 1.0)
+        if not collect_trajectory:
+            return samples, None, None
+        return (
+            samples,
+            torch.stack(trajectory),
+            torch.tensor(trajectory_timesteps, dtype=torch.long),
+        )
 
     def to(self, device: torch.device) -> "DDPM":
         nn.Module.to(self, device)

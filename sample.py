@@ -30,6 +30,7 @@ from datetime import datetime
 
 import yaml
 import torch
+from PIL import Image as PILImage, ImageDraw
 from tqdm import tqdm
 
 from src.models import create_model_from_config
@@ -92,6 +93,52 @@ def save_samples(
     save_image((samples + 1.0) / 2.0, save_path, nrow=nrow)
 
 
+def save_trajectory_grid(
+    trajectory: torch.Tensor,
+    timesteps: torch.Tensor,
+    save_path: str,
+) -> None:
+    """Save trajectory rows with diffusion-timestep labels above each column."""
+    if trajectory.ndim != 5:
+        raise ValueError(
+            "Expected trajectory with shape (frames, samples, C, H, W), "
+            f"got {tuple(trajectory.shape)}"
+        )
+    if timesteps.ndim != 1 or timesteps.numel() != trajectory.shape[0]:
+        raise ValueError("timesteps must contain one entry per trajectory frame")
+
+    trajectory = trajectory.detach().float().cpu().clamp(-1.0, 1.0)
+    trajectory = ((trajectory + 1.0) * 127.5).round().to(torch.uint8)
+    frame_count, sample_count, channels, height, width = trajectory.shape
+    if channels not in (1, 3):
+        raise ValueError("Trajectory images must have one or three channels")
+
+    gap = 4
+    label_height = 20
+    canvas_width = gap + frame_count * (width + gap)
+    canvas_height = label_height + gap + sample_count * (height + gap)
+    canvas = PILImage.new('RGB', (canvas_width, canvas_height), color='white')
+    draw = ImageDraw.Draw(canvas)
+
+    for frame_index, timestep in enumerate(timesteps.tolist()):
+        label = 'noise' if frame_index == 0 else ('x0' if timestep < 0 else f't={timestep}')
+        x = gap + frame_index * (width + gap)
+        draw.text((x, 3), label, fill='black')
+        for sample_index in range(sample_count):
+            image = trajectory[frame_index, sample_index]
+            if channels == 1:
+                array = image[0].numpy()
+                frame_image = PILImage.fromarray(array, mode='L').convert('RGB')
+            else:
+                array = image.permute(1, 2, 0).numpy()
+                frame_image = PILImage.fromarray(array, mode='RGB')
+            y = label_height + gap + sample_index * (height + gap)
+            canvas.paste(frame_image, (x, y))
+
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    canvas.save(save_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate samples from trained model')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -115,6 +162,14 @@ def main():
     # Sampling arguments
     parser.add_argument('--num_steps', type=int, default=None,
                        help='Number of sampling steps (default: from config)')
+    parser.add_argument('--trajectory', action='store_true',
+                       help='Save intermediate reverse-diffusion states as a grid')
+    parser.add_argument('--trajectory_interval', type=int, default=100,
+                       help='Save one trajectory frame every N reverse steps (default: 100)')
+    parser.add_argument('--trajectory_output', type=str, default=None,
+                       help='Output path for the trajectory grid')
+    parser.add_argument('--trajectory_samples', type=int, default=4,
+                       help='Number of sample rows shown in the trajectory grid (default: 4)')
     
     # Other options
     parser.add_argument('--no_ema', action='store_true',
@@ -127,6 +182,10 @@ def main():
         parser.error("--num_samples must be positive")
     if args.batch_size < 1:
         parser.error("--batch_size must be positive")
+    if args.trajectory_interval < 1:
+        parser.error("--trajectory_interval must be positive")
+    if args.trajectory_samples < 1:
+        parser.error("--trajectory_samples must be positive")
     # Added implementation: reject invalid generation sizes before model loading.
 
     # Command-line values validated; begin sampling setup.
@@ -170,6 +229,9 @@ def main():
     print(f"Generating {args.num_samples} samples...")
 
     all_samples = []
+    trajectory_batches = []
+    trajectory_timesteps = None
+    trajectory_remaining = min(args.num_samples, args.trajectory_samples)
     remaining = args.num_samples
     sample_idx = 0
 
@@ -186,12 +248,27 @@ def main():
             if num_steps is None:
                 num_steps = config.get('sampling', {}).get('num_steps')
 
-            samples = method.sample(
-                batch_size=batch_size,
-                image_shape=image_shape,
-                num_steps=num_steps,
-                # TODO: add your arugments here
-            )
+            if args.trajectory and trajectory_remaining > 0:
+                samples, trajectory, current_timesteps = method.sample_trajectory(
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    num_steps=num_steps,
+                    trajectory_interval=args.trajectory_interval,
+                    trajectory_samples=min(trajectory_remaining, batch_size),
+                )
+                if trajectory_timesteps is None:
+                    trajectory_timesteps = current_timesteps
+                if trajectory_remaining > 0:
+                    take = min(trajectory_remaining, trajectory.shape[1])
+                    trajectory_batches.append(trajectory[:, :take])
+                    trajectory_remaining -= take
+            else:
+                samples = method.sample(
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    num_steps=num_steps,
+                    # TODO: add your arugments here
+                )
 
             # Save individual images immediately or collect for grid
             if args.grid:
@@ -220,6 +297,20 @@ def main():
         print(f"Saved grid to {args.output}")
     else:
         print(f"Saved {args.num_samples} individual images to {args.output_dir}")
+
+    if args.trajectory:
+        trajectory = torch.cat(trajectory_batches, dim=1)
+        # Arrange one sample per row and reverse-time frames left-to-right,
+        # matching the notebook's trajectory visualization.
+        if args.trajectory_output is None:
+            if args.output is not None:
+                output_root, output_ext = os.path.splitext(args.output)
+                args.trajectory_output = f"{output_root}_trajectory{output_ext or '.png'}"
+            else:
+                args.trajectory_output = os.path.join(args.output_dir, 'trajectory.png')
+        save_trajectory_grid(trajectory, trajectory_timesteps, args.trajectory_output)
+        print(f"Saved trajectory to {args.trajectory_output}")
+        print(f"Trajectory timesteps (initial to final): {trajectory_timesteps.tolist()}")
 
     # Restore EMA if applied
     if not args.no_ema:

@@ -220,6 +220,11 @@ python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --num_samp
 
 # With custom number of sampling steps
 python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --num_steps 500
+
+# Show the 1000-step denoising trajectory (4 samples, one frame every 100 steps)
+python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm \
+    --num_steps 1000 --num_samples 4 --grid --trajectory \
+    --trajectory_interval 100 --trajectory_output trajectory.png
 ```
 
 ### Evaluation
