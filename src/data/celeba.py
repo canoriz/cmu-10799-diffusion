@@ -12,6 +12,7 @@ What you need to implement:
 """
 
 import os
+from io import BytesIO
 from typing import Optional, Tuple, Callable
 
 import torch
@@ -68,7 +69,7 @@ class CelebADataset(Dataset):
     def _load_from_hub(self):
         """Load dataset from HuggingFace Hub or cached Arrow format."""
         try:
-            from datasets import load_dataset, load_from_disk
+            from datasets import DatasetDict, load_dataset, load_from_disk
         except ImportError:
             raise ImportError(
                 "Please install the datasets library to load from HuggingFace Hub:\n"
@@ -79,7 +80,8 @@ class CelebADataset(Dataset):
         from pathlib import Path
         root_path = Path(self.root)
         print(f"Attempt to use cached dataset from: {self.root}")
-        if root_path.exists() and (root_path / "dataset_dict.json").exists():
+        cache_markers = (root_path / "dataset_dict.json", root_path / "dataset_info.json")
+        if root_path.exists() and any(marker.exists() for marker in cache_markers):
             print("=" * 60)
             print(f"✓ Using cached dataset from: {self.root}")
             print("  (No download required - using local Arrow format cache)")
@@ -91,16 +93,22 @@ class CelebADataset(Dataset):
             # Load the dataset from disk
             dataset = load_from_disk(self.root)
 
-            if hf_split == "all":
-                # Combine all splits
-                all_data = []
-                for split_name in dataset.keys():
-                    all_data.extend(list(dataset[split_name]))
-                self.data = all_data
+            if isinstance(dataset, DatasetDict):
+                if hf_split == "all":
+                    all_data = []
+                    for split_name in dataset.keys():
+                        all_data.extend(list(dataset[split_name]))
+                    self.data = all_data
+                else:
+                    self.data = list(dataset[hf_split])
             else:
-                self.data = list(dataset[hf_split])
+                if hf_split not in ("all", "train"):
+                    raise ValueError(f"Cached dataset has no '{hf_split}' split")
+                self.data = list(dataset)
 
             print(f"✓ Loaded {len(self.data)} images from cached '{hf_split}' split")
+            # Added implementation: accept both cached DatasetDict splits and
+            # single Dataset caches produced by save_to_disk().
             return
 
         # Otherwise, download from HuggingFace Hub
@@ -175,12 +183,13 @@ class CelebADataset(Dataset):
         if not root_path.exists():
             return False
 
-        # HuggingFace datasets saved with save_to_disk() have dataset_info.json
-        if not (root_path / "dataset_info.json").exists():
+        # HuggingFace Dataset and DatasetDict caches use different marker files.
+        cache_markers = (root_path / "dataset_info.json", root_path / "dataset_dict.json")
+        if not any(marker.exists() for marker in cache_markers):
             return False
 
         try:
-            from datasets import load_from_disk
+            from datasets import DatasetDict, load_from_disk
         except ImportError:
             return False
 
@@ -192,16 +201,22 @@ class CelebADataset(Dataset):
         # Load the dataset
         dataset = load_from_disk(self.root)
 
-        if hf_split == "all":
-            # Combine all splits
-            all_data = []
-            for split_name in dataset.keys():
-                all_data.extend(list(dataset[split_name]))
-            self.data = all_data
+        if isinstance(dataset, DatasetDict):
+            if hf_split == "all":
+                all_data = []
+                for split_name in dataset.keys():
+                    all_data.extend(list(dataset[split_name]))
+                self.data = all_data
+            else:
+                self.data = list(dataset[hf_split])
         else:
-            self.data = list(dataset[hf_split])
+            if hf_split not in ("all", "train"):
+                raise ValueError(f"Saved dataset has no '{hf_split}' split")
+            self.data = list(dataset)
 
         print(f"Loaded {len(self.data)} images from {hf_split} split")
+        # Added implementation: support both DatasetDict and single Dataset
+        # Arrow layouts before the normal image transform pipeline.
         return True
 
     def _load_split_data(self, split_path):
@@ -230,18 +245,39 @@ class CelebADataset(Dataset):
             })
 
         return data
-    
+
     def _build_transforms(self) -> Callable:
         """Build the preprocessing transforms."""
         transform_list = []
 
         # TODO: write your image transforms & augmentation
 
+        # Keep the spatial contract explicit even when the source dataset is
+        # already at the target resolution.
+        transform_list.append(
+            transforms.Resize(
+                (self.image_size, self.image_size),
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+        )
+
         # Only resize if needed (dataset images are already 64x64)
+
+        if self.augment and self.split == "train":
+            transform_list.append(transforms.RandomHorizontalFlip())
 
         # For Data augmentation you can do something like
         # if self.augment and self.split == "train":
         #     transform_list.append(...)
+
+        # DDPMs in this project operate on images in [-1, 1].
+        transform_list.extend([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+
+        # Added implementation: resize images, optionally augment training data,
+        # and normalize model inputs to [-1, 1].
 
         return transforms.Compose(transform_list)
 

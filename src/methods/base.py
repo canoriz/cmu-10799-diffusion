@@ -102,22 +102,24 @@ class BaseMethod(nn.Module, ABC):
         """Return model parameters for optimizer."""
         return self.model.parameters()
     
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self, *args, **kwargs) -> Dict[str, Any]:
         """
         Get the state dict for checkpointing.
         
         Returns:
             Dictionary containing method state
         """
-        return {
-            'model': self.model.state_dict(),
-        }
-    
-    def load_state_dict(self, state_dict: Dict[str, Any]):
+        # Added implementation: forward standard state_dict arguments to the
+        # wrapped model while preserving the method-level checkpoint format.
+        return {'model': self.model.state_dict(*args, **kwargs)}
+
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True, **kwargs):
         """
         Load a state dict from a checkpoint.
         
         Args:
             state_dict: State dict to load
         """
-        self.model.load_state_dict(state_dict['model'])
+        # Added implementation: preserve PyTorch's strict loading behavior and
+        # return its normal incompatible-key report.
+        return self.model.load_state_dict(state_dict['model'], strict=strict, **kwargs)

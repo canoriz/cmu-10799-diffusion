@@ -237,20 +237,32 @@ def generate_samples(
     if use_ema:
         ema.apply_shadow()
 
-    samples = None
-    # TODO: sample with your method.sample()
+    try:
+        if 'num_steps' not in sampling_kwargs:
+            sampling_kwargs['num_steps'] = config.get('sampling', {}).get('num_steps')
 
-    if use_ema:
-        ema.restore()
+        # Sampling configuration resolved; begin the core generation logic.
+        # TODO: sample with your method.sample()
+        samples = method.sample(
+            batch_size=num_samples,
+            image_shape=image_shape,
+            **sampling_kwargs,
+        )
+        # Added implementation: route training-time sampling through the method
+        # implementation and use the configured timestep count by default.
+    finally:
+        if use_ema:
+            ema.restore()
+        method.train_mode()
 
-    method.train_mode()
     return samples
 
 
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
-    num_samples: int,
+    num_samples: Optional[int] = None,
+    nrow: Optional[int] = None,
 ) -> None:
     """
     TODO: save generated samples as images.
@@ -259,9 +271,27 @@ def save_samples(
         samples: Generated samples tensor with shape (num_samples, C, H, W).
         save_path: File path to save the image grid.
         num_samples: Number of samples, used to calculate grid layout.
+        nrow: Optional number of images per row.
     """
+    if samples.ndim == 3:
+        samples = samples.unsqueeze(0)
+    if samples.ndim != 4:
+        raise ValueError(f"Expected samples with shape (N, C, H, W), got {tuple(samples.shape)}")
 
-    raise NotImplementedError
+    count = samples.shape[0] if num_samples is None else min(num_samples, samples.shape[0])
+    if count < 1:
+        raise ValueError("samples must contain at least one image")
+    samples = samples[:count].detach().float().cpu().clamp(-1.0, 1.0)
+    if nrow is None:
+        nrow = max(1, math.ceil(math.sqrt(count)))
+    elif nrow < 1:
+        raise ValueError("nrow must be positive")
+
+    # Sample values and grid layout validated; begin image file output.
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    # Added implementation: clamp diffusion outputs, convert them back to [0, 1],
+    # and save a configurable image grid for logging.
+    save_image(unnormalize(samples), save_path, nrow=nrow)
 
 
 def train(
@@ -541,6 +571,7 @@ def train(
         scaler.update()
 
         # EMA update - DISABLED
+        # Added implementation: update the shadow weights after each optimizer step.
         ema.update()
         
         # Accumulate metrics (store raw values, will reduce when logging)

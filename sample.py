@@ -25,6 +25,7 @@ What you need to implement:
 import os
 import sys
 import argparse
+import math
 from datetime import datetime
 
 import yaml
@@ -47,8 +48,10 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     model.load_state_dict(checkpoint['model'])
     
     # Create EMA and load
-    ema = EMA(model, decay=config['training']['ema_decay'])
-    ema.load_state_dict(checkpoint['ema'])
+    ema = EMA(model, decay=config['training'].get('ema_decay', 0.9999))
+    if 'ema' in checkpoint:
+        ema.load_state_dict(checkpoint['ema'])
+    # Added implementation: tolerate checkpoints that do not contain EMA state.
     
     return model, config, ema
 
@@ -56,7 +59,8 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
-    num_samples: int,
+    num_samples: int = None,
+    nrow: int = None,
 ) -> None:
     """
     TODO: save generated samples as images.
@@ -65,9 +69,27 @@ def save_samples(
         samples: Generated samples tensor with shape (num_samples, C, H, W).
         save_path: File path to save the image grid.
         num_samples: Number of samples, used to calculate grid layout.
+        nrow: Optional number of images per row.
     """
+    if samples.ndim == 3:
+        samples = samples.unsqueeze(0)
+    if samples.ndim != 4:
+        raise ValueError(f"Expected samples with shape (N, C, H, W), got {tuple(samples.shape)}")
 
-    raise NotImplementedError
+    count = samples.shape[0] if num_samples is None else min(num_samples, samples.shape[0])
+    if count < 1:
+        raise ValueError("samples must contain at least one image")
+    samples = samples[:count].detach().float().cpu().clamp(-1.0, 1.0)
+    if nrow is None:
+        nrow = max(1, math.ceil(math.sqrt(count)))
+    elif nrow < 1:
+        raise ValueError("nrow must be positive")
+
+    # Sample values and grid layout validated; begin image file output.
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    # Added implementation: convert clamped [-1, 1] samples to [0, 1] and
+    # save either individual images or a configurable grid.
+    save_image((samples + 1.0) / 2.0, save_path, nrow=nrow)
 
 
 def main():
@@ -101,9 +123,18 @@ def main():
                        help='Device to use')
     
     args = parser.parse_args()
-    
+    if args.num_samples < 1:
+        parser.error("--num_samples must be positive")
+    if args.batch_size < 1:
+        parser.error("--batch_size must be positive")
+    # Added implementation: reject invalid generation sizes before model loading.
+
+    # Command-line values validated; begin sampling setup.
+
     # Setup device
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    requested_device = torch.device(args.device)
+    device = torch.device('cpu') if requested_device.type == 'cuda' and not torch.cuda.is_available() else requested_device
+    # Added implementation: fall back to CPU when CUDA was requested but is unavailable.
     print(f"Using device: {device}")
     
     # Set seed
@@ -151,7 +182,9 @@ def main():
         while remaining > 0:
             batch_size = min(args.batch_size, remaining)
 
-            num_steps = args.num_steps or config['sampling']['num_steps']
+            num_steps = args.num_steps
+            if num_steps is None:
+                num_steps = config.get('sampling', {}).get('num_steps')
 
             samples = method.sample(
                 batch_size=batch_size,
@@ -166,7 +199,7 @@ def main():
             else:
                 for i in range(samples.shape[0]):
                     img_path = os.path.join(args.output_dir, f"{sample_idx:06d}.png")
-                    save_samples(samples, img_path, 1)
+                    save_samples(samples[i:i + 1], img_path, 1, nrow=1)
                     sample_idx += 1
 
             remaining -= batch_size
